@@ -1,0 +1,124 @@
+#' @import dplyr
+#' @importFrom DBI dbConnect dbExecute dbDisconnect
+#' @importFrom duckdb duckdb duckdb_register
+#' @importFrom utils download.file
+#' @importFrom rappdirs user_cache_dir
+NULL
+
+# Globale Variable für den Cache-Pfad
+get_cache_dir <- function() {
+  rappdirs::user_cache_dir("dlexDB")
+}
+
+#' Verbindung zur Datenbank herstellen (und Download falls nötig)
+#' @export
+dlex_connect <- function() {
+  cache_dir <- get_cache_dir()
+  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+  # URL zum Dataset (Hugging Face)
+  db_url <- "https://huggingface.co/datasets/rkliegl/dlexdb/resolve/main/data/typposlem.parquet"
+  db_file <- file.path(cache_dir, "typposlem.parquet")
+
+  # Download Logik (nur wenn Datei fehlt)
+  if (!file.exists(db_file)) {
+    message("Initialisiere dlexDB...")
+    message("Lade Kerndaten herunter. Dies geschieht nur einmal.")
+
+    # Timeout temporär erhöhen für den Download
+    old_timeout <- getOption("timeout")
+    options(timeout = 3600)
+    on.exit(options(timeout = old_timeout))
+
+    tryCatch({
+      utils::download.file(db_url, destfile = db_file, mode = "wb")
+      message("Download erfolgreich.")
+    }, error = function(e) {
+      if (file.exists(db_file)) unlink(db_file)
+      stop("Fehler beim Download: ", e$message)
+    })
+  }
+
+  # Verbindung herstellen (read_only für Sicherheit)
+  con <- DBI::dbConnect(duckdb::duckdb(), read_only = TRUE)
+
+  # View registrieren
+  DBI::dbExecute(con, paste0("CREATE VIEW dlex AS SELECT * FROM '", db_file, "'"))
+
+  return(con)
+}
+
+#' Abruf lexikalischer Statistiken für eine Wortliste
+#' @param word_list Ein Character-Vektor mit den Wörtern.
+#' @param db_con Optional: Eine bestehende Verbindung.
+#' @return Ein Dataframe mit Statistiken.
+#' @export
+dlex_lookup <- function(word_list, db_con = NULL) {
+  # Auto-Connect
+  created_con <- FALSE
+  if (is.null(db_con)) {
+    db_con <- dlex_connect()
+    created_con <- TRUE
+  }
+
+  # Verbindung am Ende schließen, falls wir sie hier geöffnet haben
+  on.exit({
+    if (created_con) DBI::dbDisconnect(db_con)
+  })
+
+  # Input Tabelle registrieren
+  input_df <- data.frame(search_term = word_list, stringsAsFactors = FALSE)
+  duckdb::duckdb_register(db_con, "user_input", input_df)
+
+  # Die eigentliche Abfrage
+  result <- tbl(db_con, "user_input") %>%
+    left_join(tbl(db_con, "dlex"), by = c("search_term" = "typ_cit")) %>%
+    select(
+      Wort = search_term,
+      PoS = pos_tag,
+      Lemma = lem_cit,
+      Freq_Norm = typposlem_freq_nor,
+      Freq_Abs = typposlem_freq_abs,
+      Silben = typ_syls_cnt,
+      Orth_Nachbarn = typ_nei_lev_all_cnt_abs
+    ) %>%
+    collect()
+
+  return(result)
+}
+
+#' Suche nach Wörtern mit Regulären Ausdrücken (Regex)
+#' @param pattern Ein Regulärer Ausdruck (z.B. "^Ver.*ung$").
+#' @param min_freq Minimale normalisierte Frequenz (Standard: 0).
+#' @param db_con Optional: Eine bestehende Verbindung.
+#' @return Ein Dataframe mit den Treffern.
+#' @export
+dlex_regex <- function(pattern, min_freq = 0, db_con = NULL) {
+  created_con <- FALSE
+  if (is.null(db_con)) {
+    db_con <- dlex_connect()
+    created_con <- TRUE
+  }
+  on.exit({
+    if (created_con) DBI::dbDisconnect(db_con)
+  })
+
+  # Hier nutzen wir jetzt explizit dbplyr::sql, um den Konflikt zu vermeiden
+  result <- tbl(db_con, "dlex") %>%
+    filter(
+      dbplyr::sql(paste0("regexp_matches(typ_cit, '", pattern, "')")),
+      typposlem_freq_nor >= min_freq
+    ) %>%
+    select(
+      Wort = typ_cit,
+      PoS = pos_tag,
+      Lemma = lem_cit,
+      Freq_Norm = typposlem_freq_nor,
+      Freq_Abs = typposlem_freq_abs,
+      Silben = typ_syls_cnt
+    ) %>%
+    collect() %>%
+    arrange(desc(Freq_Norm))
+
+  return(result)
+}
