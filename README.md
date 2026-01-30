@@ -69,5 +69,5 @@ print(kurz_bsp)
 ## Credits
 
 Daten basieren auf dlexDB / DWDS Kernkorpus. 
-R-Pake von Reinhold Kliegl, Kay-Michael Würzner und Gemini 3 Pro
+R-Package by Reinhold Kliegl, Kay-Michael Würzner and Gemini 3 Pro
  
